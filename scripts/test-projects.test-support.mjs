@@ -51,8 +51,7 @@ import { resolveVitestCliEntry, resolveVitestNodeArgs } from "./run-vitest.mjs";
 
 const DEFAULT_VITEST_CONFIG = "test/vitest/vitest.unit.config.ts";
 const AGENTS_CORE_VITEST_CONFIG = "test/vitest/vitest.agents-core.config.ts";
-const AGENTS_EMBEDDED_AGENT_VITEST_CONFIG =
-  "test/vitest/vitest.agents-embedded-agent.config.ts";
+const AGENTS_EMBEDDED_AGENT_VITEST_CONFIG = "test/vitest/vitest.agents-embedded-agent.config.ts";
 const AGENTS_SUPPORT_VITEST_CONFIG = "test/vitest/vitest.agents-support.config.ts";
 const AGENTS_TOOLS_VITEST_CONFIG = "test/vitest/vitest.agents-tools.config.ts";
 const AGENTS_VITEST_CONFIG = "test/vitest/vitest.agents.config.ts";
@@ -249,7 +248,6 @@ const VITEST_CONFIG_BY_KIND = {
   agentTools: AGENTS_TOOLS_VITEST_CONFIG,
   agent: AGENTS_VITEST_CONFIG,
   agentsCore: AGENTS_CORE_VITEST_CONFIG,
-  agentsPiEmbedded: AGENTS_PI_EMBEDDED_VITEST_CONFIG,
   agentsSupport: AGENTS_SUPPORT_VITEST_CONFIG,
   agentsTools: AGENTS_TOOLS_VITEST_CONFIG,
   autoReplyCore: AUTO_REPLY_CORE_VITEST_CONFIG,
@@ -1741,7 +1739,6 @@ export function buildVitestRunPlans(
     "agentTools",
     "agent",
     "agentsCore",
-    "agentsPiEmbedded",
     "agentsSupport",
     "agentsTools",
     "plugin",

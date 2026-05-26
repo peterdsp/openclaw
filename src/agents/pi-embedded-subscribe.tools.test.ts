@@ -188,6 +188,23 @@ describe("sanitizeToolResult", () => {
     expect(text).toContain("MODEL=gpt-4");
   });
 
+  it("preserves env placeholders in tool output text", () => {
+    const result = {
+      content: [
+        {
+          type: "text",
+          text: 'DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"\nTELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"',
+        },
+      ],
+    };
+
+    const text = getTextContent(sanitizeToolResult(result));
+
+    expect(text).toBe(
+      'DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"\nTELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"',
+    );
+  });
+
   it("redacts Bearer authorization tokens", () => {
     const result = {
       content: [{ type: "text", text: "Authorization: Bearer abcdef0123456789QWERTY=" }],

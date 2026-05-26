@@ -45,6 +45,30 @@ describe("redactSensitiveText", () => {
     expect(output).toBe("OPENAI_API_KEY=sk-123…cdef");
   });
 
+  it("preserves shell env references in assignments", () => {
+    const input = [
+      'DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-}"',
+      "OPENAI_API_KEY=$OPENAI_API_KEY",
+      "GITHUB_TOKEN=${GITHUB_TOKEN}",
+    ].join("\n");
+    const output = redactSensitiveText(input, {
+      mode: "tools",
+      patterns: defaults,
+    });
+    expect(output).toBe(input);
+  });
+
+  it("masks literal shell env expansion defaults in assignments", () => {
+    const fallback = "discordliteral1234567890";
+    const input = `DISCORD_BOT_TOKEN="\${DISCORD_BOT_TOKEN:-${fallback}}"`;
+    const output = redactSensitiveText(input, {
+      mode: "tools",
+      patterns: defaults,
+    });
+    expect(output).not.toContain(fallback);
+    expect(output).toBe('DISCORD_BOT_TOKEN="${DISC…890}"');
+  });
+
   it("masks JSON-escaped quoted env assignments while keeping the key", () => {
     const xai = "issue85049-xai-cleartext-token-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
     const brave = "issue85049-brave-cleartext-token-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";

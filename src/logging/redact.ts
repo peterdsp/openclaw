@@ -142,11 +142,22 @@ function redactPemBlock(block: string): string {
   return `${lines[0]}\n…redacted…\n${lines[lines.length - 1]}`;
 }
 
+function isShellVariableReference(token: string): boolean {
+  return /^\$[A-Z_][A-Z0-9_]*$/.test(token) || /^\$\{[A-Z_][A-Z0-9_]*(?::[-=?+])?\}$/.test(token);
+}
+
+function isShellParameterExpansionTail(token: string): boolean {
+  return /^[-=?+]\}$/.test(token);
+}
+
 function redactMatch(match: string, groups: string[]): string {
   if (match.includes("PRIVATE KEY-----")) {
     return redactPemBlock(match);
   }
   const token = groups.findLast((value) => typeof value === "string" && value.length > 0) ?? match;
+  if (isShellVariableReference(token) || isShellParameterExpansionTail(token)) {
+    return match;
+  }
   const masked = maskToken(token);
   if (token === match) {
     return masked;

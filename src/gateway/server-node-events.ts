@@ -1,11 +1,11 @@
 // Gateway node event dispatcher.
 // Handles device/node-originated events and routes them to sessions/channels.
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { updatePairedDeviceMetadata } from "../infra/device-pairing.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -24,15 +24,13 @@ import type { NodeEvent, NodeEventContext } from "./server-node-events-types.js"
 import {
   agentCommandFromIngress,
   buildOutboundSessionContext,
-  canonicalizeSessionEntryAliases,
   createOutboundSendDeps,
   defaultRuntime,
   deleteMediaBuffer,
-  emitSessionTranscriptUpdate,
   enqueueSystemEvent,
   formatForLog,
   getRuntimeConfig,
-  loadOrCreateDeviceIdentity,
+  loadOrCreateProcessDeviceIdentity,
   loadSessionEntry,
   normalizeChannelId,
   normalizeMainKey,
@@ -44,11 +42,11 @@ import {
   resolveGatewayModelSupportsImages,
   resolveOutboundTarget,
   resolveSessionAgentId,
-  resolveSessionFilePath,
   resolveSessionModelRef,
+  persistInboundImagesForTranscript,
   sanitizeInboundSystemTags,
-  saveMediaBuffer,
   sendDurableMessageBatch,
+  canonicalizeSessionEntryAliases,
 } from "./server-node-events.runtime.js";
 
 const MAX_EXEC_EVENT_OUTPUT_CHARS = 180;
@@ -240,7 +238,7 @@ function compactExecEventOutput(raw: string) {
     return normalized;
   }
   const safe = Math.max(1, MAX_EXEC_EVENT_OUTPUT_CHARS - 1);
-  return `${normalized.slice(0, safe)}…`;
+  return `${sliceUtf16Safe(normalized, 0, safe)}…`;
 }
 
 function compactNotificationEventText(raw: string) {
@@ -252,7 +250,7 @@ function compactNotificationEventText(raw: string) {
     return normalized;
   }
   const safe = Math.max(1, MAX_NOTIFICATION_EVENT_TEXT_CHARS - 1);
-  return `${normalized.slice(0, safe)}…`;
+  return `${sliceUtf16Safe(normalized, 0, safe)}…`;
 }
 
 type LoadedSessionEntry = ReturnType<typeof loadSessionEntry>;
@@ -342,80 +340,6 @@ function parsePayloadObject(payloadJSON?: string | null): Record<string, unknown
   return typeof payload === "object" && payload !== null
     ? (payload as Record<string, unknown>)
     : null;
-}
-
-type SavedMediaEntry = { id: string; path: string; size: number; contentType: string };
-
-async function persistAgentRequestImages(params: {
-  images: Array<{ type: "image"; data: string; mimeType: string }>;
-  offloadedRefs: Array<{ id: string; path: string; mimeType: string }>;
-  logGateway: NodeEventContext["logGateway"];
-}): Promise<SavedMediaEntry[]> {
-  if (params.images.length === 0 && params.offloadedRefs.length === 0) {
-    return [];
-  }
-  const saved: SavedMediaEntry[] = [];
-  for (const img of params.images) {
-    try {
-      const media = await saveMediaBuffer(Buffer.from(img.data, "base64"), img.mimeType, "inbound");
-      saved.push({ ...media, contentType: media.contentType ?? img.mimeType });
-    } catch (err) {
-      params.logGateway.warn(
-        `agent.request: failed to persist inbound image (${img.mimeType}): ${formatForLog(err)}`,
-      );
-    }
-  }
-  for (const ref of params.offloadedRefs) {
-    saved.push({ id: ref.id, path: ref.path, size: 0, contentType: ref.mimeType });
-  }
-  return saved;
-}
-
-function emitAgentRequestTranscript(params: {
-  sessionId: string;
-  storePath: string | undefined;
-  canonicalKey: string;
-  message: string;
-  savedMedia: SavedMediaEntry[];
-  now: number;
-}) {
-  const { sessionId, storePath, canonicalKey, message, savedMedia, now } = params;
-  let transcriptPath: string | null;
-  try {
-    const sessionsDir = storePath ? path.dirname(storePath) : undefined;
-    transcriptPath = resolveSessionFilePath(
-      sessionId,
-      undefined,
-      sessionsDir ? { sessionsDir } : undefined,
-    );
-  } catch {
-    return;
-  }
-  if (!transcriptPath) {
-    return;
-  }
-
-  const mediaPaths = savedMedia.map((entry) => entry.path);
-  const mediaFields =
-    mediaPaths.length > 0
-      ? {
-          MediaPath: mediaPaths[0],
-          MediaPaths: mediaPaths,
-          MediaType: savedMedia[0]?.contentType ?? "application/octet-stream",
-          MediaTypes: savedMedia.map((entry) => entry.contentType ?? "application/octet-stream"),
-        }
-      : {};
-
-  emitSessionTranscriptUpdate({
-    sessionFile: transcriptPath,
-    sessionKey: canonicalKey,
-    message: {
-      role: "user" as const,
-      content: message,
-      timestamp: now,
-      ...mediaFields,
-    },
-  });
 }
 
 async function sendReceiptAck(params: {
@@ -555,12 +479,14 @@ export const handleNodeEvent = async (
       const { storePath, entry, canonicalKey, storeKeys } = loadSessionEntry(sessionKey);
 
       let message = (link?.message ?? "").trim();
+      const transcriptMessage = message;
       const normalizedAttachments = normalizeRpcAttachmentsToChatAttachments(
         link?.attachments ?? undefined,
       );
       let images: Array<{ type: "image"; data: string; mimeType: string }> = [];
       let imageOrder: PromptImageOrderEntry[] = [];
-      let offloadedRefs: Array<{ id: string; path: string; mimeType: string }> = [];
+      let offloadedRefs: Awaited<ReturnType<typeof parseMessageWithAttachments>>["offloadedRefs"] =
+        [];
       if (!message && normalizedAttachments.length === 0) {
         return undefined;
       }
@@ -588,13 +514,13 @@ export const handleNodeEvent = async (
           message = parsed.message.trim();
           images = parsed.images;
           imageOrder = parsed.imageOrder;
-          offloadedRefs = parsed.offloadedRefs ?? [];
+          offloadedRefs = parsed.offloadedRefs;
           if (message.length > 20_000) {
             ctx.logGateway.warn(
               `agent.request message exceeds limit after attachment parsing (length=${message.length})`,
             );
-            if (offloadedRefs.length > 0) {
-              for (const ref of offloadedRefs) {
+            if (parsed.offloadedRefs && parsed.offloadedRefs.length > 0) {
+              for (const ref of parsed.offloadedRefs) {
                 try {
                   await deleteMediaBuffer(ref.id);
                 } catch (cleanupErr) {
@@ -675,17 +601,22 @@ export const handleNodeEvent = async (
         );
       }
 
-      const savedMedia = await persistAgentRequestImages({
-        images,
-        offloadedRefs,
-        logGateway: ctx.logGateway,
-      });
+      const transcriptMedia = (
+        await persistInboundImagesForTranscript({
+          images,
+          imageOrder,
+          offloadedRefs,
+          log: ctx.logGateway,
+          logContext: "agent.request",
+        })
+      ).map((media) => ({ path: media.path, contentType: media.contentType }));
 
       dispatchNodeAgentCommand(ctx, nodeId, {
         runId: sessionId,
         message,
         images,
         imageOrder,
+        ...(transcriptMedia.length > 0 ? { transcriptMessage, transcriptMedia } : {}),
         sessionId,
         sessionKey: canonicalKey,
         thinking: link?.thinking ?? undefined,
@@ -697,16 +628,6 @@ export const handleNodeEvent = async (
         messageChannel: "node",
         allowModelOverride: false,
       });
-
-      emitAgentRequestTranscript({
-        sessionId,
-        storePath,
-        canonicalKey,
-        message,
-        savedMedia,
-        now,
-      });
-
       return undefined;
     }
     case "notifications.changed": {
@@ -914,7 +835,7 @@ export const handleNodeEvent = async (
       try {
         if (transport === "relay") {
           const gatewayDeviceId = normalizeOptionalString(obj.gatewayDeviceId) ?? "";
-          const currentGatewayDeviceId = loadOrCreateDeviceIdentity().deviceId;
+          const currentGatewayDeviceId = loadOrCreateProcessDeviceIdentity().deviceId;
           if (!gatewayDeviceId || gatewayDeviceId !== currentGatewayDeviceId) {
             ctx.logGateway.warn(
               `push relay register rejected node=${nodeId}: gateway identity mismatch`,

@@ -46,7 +46,7 @@ const buildSessionLookup = (
 
 const ingressAgentCommandMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const registerApnsRegistrationMock = vi.hoisted(() => vi.fn());
-const loadOrCreateDeviceIdentityMock = vi.hoisted(() =>
+const loadOrCreateProcessDeviceIdentityMock = vi.hoisted(() =>
   vi.fn(() => ({
     deviceId: "gateway-device-1",
     publicKeyPem: "public",
@@ -54,6 +54,7 @@ const loadOrCreateDeviceIdentityMock = vi.hoisted(() =>
   })),
 );
 const parseMessageWithAttachmentsMock = vi.hoisted(() => vi.fn());
+const persistInboundImagesForTranscriptMock = vi.hoisted(() => vi.fn());
 const normalizeChannelIdMock = vi.hoisted(() =>
   vi.fn((channel?: string | null) => channel ?? null),
 );
@@ -80,11 +81,10 @@ const runtimeMocks = vi.hoisted(() => ({
   defaultRuntime: {},
   deleteMediaBuffer: vi.fn(async () => {}),
   deliverOutboundPayloads: vi.fn(async () => {}),
-  emitSessionTranscriptUpdate: vi.fn(),
   enqueueSystemEvent: vi.fn(),
   formatForLog: vi.fn((err: unknown) => (err instanceof Error ? err.message : String(err))),
   getRuntimeConfig: vi.fn(() => ({ session: { mainKey: "agent:main:main" } })),
-  loadOrCreateDeviceIdentity: loadOrCreateDeviceIdentityMock,
+  loadOrCreateProcessDeviceIdentity: loadOrCreateProcessDeviceIdentityMock,
   loadSessionEntry: vi.fn((sessionKey: string) => buildSessionLookup(sessionKey)),
   canonicalizeSessionEntryAliases: vi.fn(),
   normalizeChannelId: normalizeChannelIdMock,
@@ -118,19 +118,13 @@ const runtimeMocks = vi.hoisted(() => ({
   ),
   resolveOutboundTarget: vi.fn(({ to }: { to: string }) => ({ ok: true, to })),
   resolveSessionAgentId: vi.fn(() => "main"),
-  resolveSessionFilePath: vi.fn((sessionId: string) => `/tmp/sessions/${sessionId}.jsonl`),
   resolveSessionModelRef: vi.fn(
     (_cfg: OpenClawConfig, entry?: { model?: string; modelProvider?: string }) => ({
       provider: entry?.modelProvider ?? "test-provider",
       model: entry?.model ?? "default-model",
     }),
   ),
-  saveMediaBuffer: vi.fn(async (_buf: Buffer, mimeType: string) => ({
-    id: `media-${Math.random().toString(36).slice(2, 8)}`,
-    path: `/tmp/media/saved-${Date.now()}.bin`,
-    size: 100,
-    contentType: mimeType,
-  })),
+  persistInboundImagesForTranscript: persistInboundImagesForTranscriptMock,
   sanitizeInboundSystemTags: sanitizeInboundSystemTagsMock,
   scopedHeartbeatWakeOptions: vi.fn((sessionKey?: string, opts?: { reason: string }) => {
     const wakeOptions = { reason: opts?.reason };
@@ -157,13 +151,11 @@ import {
   resetNodeEventDeduplicationForTests,
 } from "./server-node-events.js";
 
-const emitSessionTranscriptUpdateMock = runtimeMocks.emitSessionTranscriptUpdate;
 const enqueueSystemEventMock = runtimeMocks.enqueueSystemEvent;
 const requestHeartbeatMock = runtimeMocks.requestHeartbeat;
 const loadConfigMock = runtimeMocks.getRuntimeConfig;
 const agentCommandMock = runtimeMocks.agentCommandFromIngress;
 const canonicalizeSessionEntryAliasesMock = runtimeMocks.canonicalizeSessionEntryAliases;
-const saveMediaBufferMock = runtimeMocks.saveMediaBuffer;
 const loadSessionEntryMock = runtimeMocks.loadSessionEntry;
 const registerApnsRegistrationVi = runtimeMocks.registerApnsRegistration;
 const normalizeChannelIdVi = runtimeMocks.normalizeChannelId;
@@ -275,8 +267,10 @@ describe("node exec events", () => {
     enqueueSystemEventMock.mockReturnValue(true);
     requestHeartbeatMock.mockClear();
     registerApnsRegistrationVi.mockClear();
-    loadOrCreateDeviceIdentityMock.mockClear();
+    loadOrCreateProcessDeviceIdentityMock.mockClear();
     normalizeChannelIdVi.mockClear();
+    persistInboundImagesForTranscriptMock.mockReset();
+    persistInboundImagesForTranscriptMock.mockResolvedValue([]);
     normalizeChannelIdVi.mockImplementation((channel?: string | null) => channel ?? null);
     sanitizeInboundSystemTagsMock.mockClear();
     updatePairedDeviceMetadataMock.mockClear();
@@ -565,6 +559,28 @@ describe("node exec events", () => {
     expect(text.endsWith("…")).toBe(true);
     expect(text.length).toBeLessThan(280);
     expect(requestHeartbeatMock).toHaveBeenCalledWith(execEventHeartbeatOptions());
+  });
+
+  it("does not split surrogate pairs when truncating exec.finished output", async () => {
+    // 178 ASCII chars + emoji (🫠 = 2 UTF-16 code units at pos 178-179) = 180+ total.
+    // safe = 179 → old slice(0,179) would land on a lone high surrogate at pos 178.
+    const emoji = "🫠";
+    const padded = "A".repeat(178) + emoji + "tail";
+    const ctx = buildExecCtx();
+    await handleNodeEvent(ctx, "node-2", {
+      event: "exec.finished",
+      payloadJSON: JSON.stringify({
+        runId: "run-surrogate",
+        exitCode: 0,
+        timedOut: false,
+        output: padded,
+      }),
+    });
+
+    const [[text]] = enqueueSystemEventMock.mock.calls;
+    // Must not contain a lone high surrogate (U+D800–U+DBFF).
+    expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(text.endsWith("…")).toBe(true);
   });
 
   it("does not enqueue or wake agent work for exec.denied events", async () => {
@@ -1145,8 +1161,6 @@ describe("agent request events", () => {
     canonicalizeSessionEntryAliasesMock.mockClear();
     loadSessionEntryMock.mockClear();
     normalizeChannelIdVi.mockClear();
-    saveMediaBufferMock.mockClear();
-    emitSessionTranscriptUpdateMock.mockClear();
     normalizeChannelIdVi.mockImplementation((channel?: string | null) => channel ?? null);
     parseMessageWithAttachmentsMock.mockResolvedValue({
       message: "parsed message",
@@ -1263,6 +1277,60 @@ describe("agent request events", () => {
     expectFields(parseCall?.[2], { supportsInlineImages: false });
   });
 
+  it("passes ordered durable media metadata to the agent transcript recorder", async () => {
+    parseMessageWithAttachmentsMock.mockResolvedValueOnce({
+      message: "describe\n[media attached: media://inbound/offloaded]",
+      images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/jpeg" }],
+      imageOrder: ["offloaded", "inline"],
+      offloadedRefs: [
+        {
+          mediaRef: "media://inbound/offloaded",
+          id: "offloaded",
+          path: "/media/inbound/offloaded.png",
+          mimeType: "image/png",
+          label: "offloaded.png",
+          sizeBytes: 2_100_000,
+        },
+      ],
+    });
+    persistInboundImagesForTranscriptMock.mockResolvedValueOnce([
+      {
+        id: "offloaded",
+        path: "/media/inbound/offloaded.png",
+        size: 2_100_000,
+        contentType: "image/png",
+      },
+      {
+        id: "saved-inline",
+        path: "/media/inbound/saved-inline.jpg",
+        size: 5,
+        contentType: "image/jpeg",
+      },
+    ]);
+
+    await handleNodeEvent(buildCtx(), "node-media", {
+      event: "agent.request",
+      payloadJSON: JSON.stringify({
+        message: "describe",
+        sessionKey: "agent:main:main",
+        attachments: [{ type: "image", mimeType: "image/png", content: "AAAA" }],
+      }),
+    });
+
+    expect(persistInboundImagesForTranscriptMock).toHaveBeenCalledWith(
+      expect.objectContaining({ imageOrder: ["offloaded", "inline"] }),
+    );
+    expect(agentCommandMock).toHaveBeenCalledTimes(1);
+    expectFields(mockCallArg(agentCommandMock), {
+      message: "describe\n[media attached: media://inbound/offloaded]",
+      transcriptMessage: "describe",
+      transcriptMedia: [
+        { path: "/media/inbound/offloaded.png", contentType: "image/png" },
+        { path: "/media/inbound/saved-inline.jpg", contentType: "image/jpeg" },
+      ],
+    });
+  });
+
   it("declines non-image attachments cleanly when parse throws UnsupportedAttachmentError", async () => {
     const warn = vi.fn();
     const ctx = buildCtx();
@@ -1297,121 +1365,6 @@ describe("agent request events", () => {
     expect(warn).toHaveBeenCalledWith(
       "agent.request attachment parse failed: attachment a.pdf: non-image attachments not supported",
     );
-  });
-
-  it("persists inline images and emits transcript with MediaPath fields", async () => {
-    const ctx = buildCtx();
-    const savedEntry = {
-      id: "saved-img-1",
-      path: "/tmp/media/saved-img-1.bin",
-      size: 512,
-      contentType: "image/jpeg",
-    };
-    saveMediaBufferMock.mockResolvedValueOnce(savedEntry);
-    parseMessageWithAttachmentsMock.mockResolvedValueOnce({
-      message: "describe this",
-      images: [{ type: "image", data: "AAAA", mimeType: "image/jpeg" }],
-      imageOrder: ["inline" as const],
-      offloadedRefs: [],
-    });
-
-    await handleNodeEvent(ctx, "ios-share-node", {
-      event: "agent.request",
-      payloadJSON: JSON.stringify({
-        message: "describe this",
-        sessionKey: "agent:main:main",
-        attachments: [
-          { type: "image", mimeType: "image/jpeg", fileName: "photo.jpg", content: "AAAA" },
-        ],
-      }),
-    });
-
-    expect(saveMediaBufferMock).toHaveBeenCalledTimes(1);
-    expect(saveMediaBufferMock).toHaveBeenCalledWith(expect.any(Buffer), "image/jpeg", "inbound");
-
-    expect(emitSessionTranscriptUpdateMock).toHaveBeenCalledTimes(1);
-    const transcriptCall = mockCallArg(emitSessionTranscriptUpdateMock);
-    expect(transcriptCall).toMatchObject({
-      sessionFile: expect.stringContaining(".jsonl"),
-      sessionKey: "agent:main:main",
-      message: expect.objectContaining({
-        role: "user",
-        content: "describe this",
-        MediaPath: savedEntry.path,
-        MediaPaths: [savedEntry.path],
-        MediaType: "image/jpeg",
-        MediaTypes: ["image/jpeg"],
-      }),
-    });
-  });
-
-  it("includes offloaded refs in transcript media fields alongside inline images", async () => {
-    const ctx = buildCtx();
-    const inlineSaved = {
-      id: "saved-inline-1",
-      path: "/tmp/media/inline.bin",
-      size: 256,
-      contentType: "image/png",
-    };
-    saveMediaBufferMock.mockResolvedValueOnce(inlineSaved);
-    parseMessageWithAttachmentsMock.mockResolvedValueOnce({
-      message: "two images",
-      images: [{ type: "image", data: "BBBB", mimeType: "image/png" }],
-      imageOrder: ["inline" as const, "offloaded" as const],
-      offloadedRefs: [
-        { id: "offload-1", path: "/tmp/media/offloaded.bin", mimeType: "image/webp" },
-      ],
-    });
-
-    await handleNodeEvent(ctx, "ios-share-multi", {
-      event: "agent.request",
-      payloadJSON: JSON.stringify({
-        message: "two images",
-        sessionKey: "agent:main:main",
-        attachments: [
-          { type: "image", mimeType: "image/png", fileName: "a.png", content: "BBBB" },
-          { type: "image", mimeType: "image/webp", fileName: "b.webp", content: "CCCC" },
-        ],
-      }),
-    });
-
-    expect(saveMediaBufferMock).toHaveBeenCalledTimes(1);
-    expect(emitSessionTranscriptUpdateMock).toHaveBeenCalledTimes(1);
-    expect(mockCallArg(emitSessionTranscriptUpdateMock)).toMatchObject({
-      message: expect.objectContaining({
-        MediaPaths: [inlineSaved.path, "/tmp/media/offloaded.bin"],
-        MediaTypes: ["image/png", "image/webp"],
-        MediaPath: inlineSaved.path,
-        MediaType: "image/png",
-      }),
-    });
-  });
-
-  it("emits transcript without media fields when no attachments are present", async () => {
-    const ctx = buildCtx();
-    parseMessageWithAttachmentsMock.mockResolvedValueOnce({
-      message: "plain text",
-      images: [],
-      imageOrder: [],
-      offloadedRefs: [],
-    });
-
-    await handleNodeEvent(ctx, "ios-text-only", {
-      event: "agent.request",
-      payloadJSON: JSON.stringify({
-        message: "plain text",
-        sessionKey: "agent:main:main",
-      }),
-    });
-
-    expect(saveMediaBufferMock).not.toHaveBeenCalled();
-    expect(emitSessionTranscriptUpdateMock).toHaveBeenCalledTimes(1);
-    expect(mockCallArg(emitSessionTranscriptUpdateMock)).toMatchObject({
-      message: expect.objectContaining({ role: "user", content: "plain text" }),
-    });
-    expect(mockCallArg(emitSessionTranscriptUpdateMock)).toMatchObject({
-      message: expect.not.objectContaining({ MediaPath: expect.anything() }),
-    });
   });
 
   beforeEach(() => {
